@@ -13,6 +13,9 @@ from io import BytesIO as StringIO
 from zipfile import ZipFile, ZIP_DEFLATED
 import botocore
 import formic
+import subprocess
+from shutil import copyfile, rmtree
+from tempfile import mkdtemp
 from troposphere.awslambda import Code
 from stacker.session_cache import get_session
 
@@ -28,6 +31,8 @@ field of a ZIP entry.
 ZIP_PERMS_MASK = (stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO) << 16
 
 logger = logging.getLogger(__name__)
+
+LOCK_FILES = ['Pipfile', 'requirements.txt']
 
 
 def _zip_files(files, root):
@@ -299,6 +304,40 @@ def _upload_prebuilt_zip(s3_conn, bucket, prefix, name, options, path,
                             version, payload_acl)
 
 
+def _zip_package(lock_file, root, includes, excludes, follow_symlinks):
+    tmpdir = mkdtemp()
+    files = list(_find_files(root, includes, excludes, follow_symlinks))
+    for fname in files:
+        copyfile(os.path.join(root, fname),
+                 os.path.join(tmpdir, fname))
+
+    if lock_file == 'Pipfile':
+        logger.info('Creating requirements.txt from Pipfile')
+        requirements = open(os.path.join(tmpdir, 'requirements.txt'), 'w')
+        subprocess.check_call([
+            'pipenv',
+            'lock',
+            '--requirements',
+            '--keep-outdated'
+        ], cwd=root, stdout=requirements)
+
+    logger.info('Restoring modules from %s' % requirements.name)
+    subprocess.check_call([
+        'pip',
+        'install',
+        '-r',
+        requirements.name,
+        '-t',
+        tmpdir
+    ], cwd=tmpdir)
+
+    files = list(_find_files(tmpdir, '**', [], False))
+
+    contents, content_hash = _zip_files(files, tmpdir)
+    rmtree(tmpdir)
+    return contents, content_hash
+
+
 def _build_and_upload_zip(s3_conn, bucket, prefix, name, options, path,
                           follow_symlinks, payload_acl):
     includes = _check_pattern_list(options.get('include'), 'include',
@@ -306,10 +345,24 @@ def _build_and_upload_zip(s3_conn, bucket, prefix, name, options, path,
     excludes = _check_pattern_list(options.get('exclude'), 'exclude',
                                    default=[])
 
-    # os.path.join will ignore other parameters if the right-most one is an
-    # absolute path, which is exactly what we want.
-    zip_contents, zip_version = _zip_from_file_patterns(
-        path, includes, excludes, follow_symlinks)
+    lock_files = [f for f in LOCK_FILES
+                  if os.path.isfile(os.path.join(path, f))]
+    if lock_files and len(lock_files) == 1:
+        lock_file = lock_files[-1]
+        logger.info('Found %s', os.path.join(path, lock_file))
+        zip_contents, zip_version = _zip_package(lock_file,
+                                                 path,
+                                                 includes,
+                                                 excludes,
+                                                 follow_symlinks)
+    elif len(lock_files) > 1:
+        logger.warning('Found multiple lock files: %s', ','.join(lock_files))
+    else:
+        # os.path.join will ignore other parameters if the right-most one is an
+        # absolute path, which is exactly what we want.
+        zip_contents, zip_version = _zip_from_file_patterns(
+            path, includes, excludes, follow_symlinks)
+
     version = options.get('version') or zip_version
 
     return _upload_code(s3_conn, bucket, prefix, name, zip_contents, version,
