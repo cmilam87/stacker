@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import absolute_import
 from builtins import str
 from builtins import object
+import contextlib
 import copy
 import uuid
 import importlib
@@ -29,6 +30,27 @@ from .awscli_yamlhelper import yaml_parse
 from stacker.session_cache import get_session
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def cd(newdir, cleanup=lambda: True):
+    prevdir = os.getcwd()
+    os.chdir(os.path.expanduser(newdir))
+    try:
+        yield
+    finally:
+        os.chdir(prevdir)
+        cleanup()
+
+
+@contextlib.contextmanager
+def tempdir():
+    dirpath = tempfile.mkdtemp()
+
+    def cleanup():
+        shutil.rmtree(dirpath)
+    with cd(dirpath, cleanup):
+        yield dirpath
 
 
 def camel_to_snake(name):

@@ -14,14 +14,16 @@ from zipfile import ZipFile, ZIP_DEFLATED
 import botocore
 import formic
 import subprocess
-from shutil import copyfile, rmtree
-from tempfile import mkdtemp
+import errno
+import sys
+from shutil import copyfile
 from troposphere.awslambda import Code
 from stacker.session_cache import get_session
 
 from stacker.util import (
     get_config_directory,
     ensure_s3_bucket,
+    tempdir,
 )
 
 
@@ -32,7 +34,7 @@ ZIP_PERMS_MASK = (stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO) << 16
 
 logger = logging.getLogger(__name__)
 
-LOCK_FILES = ['Pipfile', 'requirements.txt']
+LOCK_FILES = ['Pipfile.lock', 'requirements.txt']
 
 
 def _zip_files(files, root):
@@ -304,37 +306,46 @@ def _upload_prebuilt_zip(s3_conn, bucket, prefix, name, options, path,
                             version, payload_acl)
 
 
+def run_command(cmd_list, cwd, stdout=sys.stdout):
+    try:
+        subprocess.check_call(cmd_list, cwd=cwd, stdout=stdout)
+    except OSError as e:
+        if e.errno == errno.ENONET:
+            logger.error('%s is not installed!', cmd_list[0])
+        raise e
+
+
 def _zip_package(lock_file, root, includes, excludes, follow_symlinks):
-    tmpdir = mkdtemp()
-    files = list(_find_files(root, includes, excludes, follow_symlinks))
-    for fname in files:
-        copyfile(os.path.join(root, fname),
-                 os.path.join(tmpdir, fname))
+    with tempdir() as tmpdir:
+        files = list(_find_files(root, includes, excludes, follow_symlinks))
+        for fname in files:
+            copyfile(os.path.join(root, fname),
+                     os.path.join(tmpdir, fname))
 
-    if lock_file == 'Pipfile':
-        logger.info('Creating requirements.txt from Pipfile')
-        requirements = open(os.path.join(tmpdir, 'requirements.txt'), 'w')
-        subprocess.check_call([
-            'pipenv',
-            'lock',
-            '--requirements',
-            '--keep-outdated'
-        ], cwd=root, stdout=requirements)
+        if lock_file == 'Pipfile.lock':
+            logger.info('Creating requirements.txt from Pipfile')
+            with open(os.path.join(tmpdir, 'requirements.txt'), 'w') \
+                    as requirements:
+                run_command([
+                    'pipenv',
+                    'lock',
+                    '--requirements',
+                    '--keep-outdated'
+                ], cwd=root, stdout=requirements)
 
-    logger.info('Restoring modules from %s' % requirements.name)
-    subprocess.check_call([
-        'pip',
-        'install',
-        '-r',
-        requirements.name,
-        '-t',
-        tmpdir
-    ], cwd=tmpdir)
+        logger.info('Restoring modules from %s' % requirements.name)
+        run_command([
+            'pip',
+            'install',
+            '-r',
+            requirements.name,
+            '-t',
+            tmpdir
+        ], cwd=tmpdir)
 
-    files = list(_find_files(tmpdir, '**', [], False))
+        files = list(_find_files(tmpdir, '**', [], False))
+        contents, content_hash = _zip_files(files, tmpdir)
 
-    contents, content_hash = _zip_files(files, tmpdir)
-    rmtree(tmpdir)
     return contents, content_hash
 
 
@@ -345,21 +356,21 @@ def _build_and_upload_zip(s3_conn, bucket, prefix, name, options, path,
     excludes = _check_pattern_list(options.get('exclude'), 'exclude',
                                    default=[])
 
-    lock_files = [f for f in LOCK_FILES
-                  if os.path.isfile(os.path.join(path, f))]
-    if lock_files and len(lock_files) == 1:
-        lock_file = lock_files[-1]
+    if os.path.isfile(os.path.join(path, 'Pipfile')):
+        if not os.path.isfile(os.path.join(path, 'Pipfile.lock')):
+            logger.warning('Found Pipfile but no Pipfile.lock!')
+        lock_file = 'Pipfile.lock'
+    elif os.path.isfile(os.path.join(path, 'requirements.txt')):
+        lock_file = 'requirements.txt'
+
+    if lock_file:
         logger.info('Found %s', os.path.join(path, lock_file))
         zip_contents, zip_version = _zip_package(lock_file,
                                                  path,
                                                  includes,
                                                  excludes,
                                                  follow_symlinks)
-    elif len(lock_files) > 1:
-        logger.warning('Found multiple lock files: %s', ','.join(lock_files))
     else:
-        # os.path.join will ignore other parameters if the right-most one is an
-        # absolute path, which is exactly what we want.
         zip_contents, zip_version = _zip_from_file_patterns(
             path, includes, excludes, follow_symlinks)
 
