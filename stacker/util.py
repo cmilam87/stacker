@@ -5,11 +5,13 @@ from builtins import str
 from builtins import object
 import contextlib
 import copy
+import errno
 import uuid
 import importlib
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,6 +32,139 @@ from .awscli_yamlhelper import yaml_parse
 from stacker.session_cache import get_session
 
 logger = logging.getLogger(__name__)
+
+
+def filter_commands(commands):
+    return [cmd for cmd in commands if cmd and len(cmd) > 0]
+
+
+def merge_commands(commands):
+    cmds = filter_commands(commands)
+    if len(cmds) == 0:
+        raise ValueError('Expected at least one non-empty command')
+    elif len(cmds) == 1:
+        return cmds[0]
+    else:
+        script = ' && '.join([shlex.quote(cmd) for cmd in cmds])
+        return ['/bin/sh', '-c', script]
+
+
+def run_command(cmd_list, cwd=os.getcwd(), stdout=sys.stdout):
+    try:
+        subprocess.check_call(cmd_list, cwd=cwd, stdout=stdout)
+    except OSError as e:
+        print(e.errno)
+        if e.errno == errno.ENOENT:
+            logger.error('%s is not installed!', cmd_list[0])
+        raise e
+
+
+class Docker(object):
+
+    @classmethod
+    def parse_options(cls, options):
+        if options.get('dockerizePip'):
+            return cls(options)
+        return None
+
+    def get_uid(self, bind_path):
+        output = subprocess.check_output(
+            ['docker', 'run', '--rm',
+             '-v', f'{bind_path}:/test', 'alpine',
+             'stat', '-c', '%u', '/bin/sh'])
+        return output.decode().strip()
+
+    def try_bind_path(self, path):
+        try:
+            output = subprocess.check_output([
+                'docker',
+                'run',
+                '--rm',
+                '-v',
+                f'{path}:/test',
+                'alpine',
+                'ls',
+                '/test/requirements.txt'
+            ]).decode().strip()
+            return output == '/test/requirements.txt'
+        except subprocess.CalledProcessError as err:
+            logger.debug(err)
+            return False
+
+    def get_bind_path(self, servicePath):
+        if sys.platform.lower() != 'win32':
+            return servicePath
+
+        bind_paths = []
+        base_bind_path = re.sub(r'\\([^\s])', '/$1', servicePath)
+
+        bind_paths.append(base_bind_path)
+        if base_bind_path.startswith('/mnt/'):
+            # cygwin "/mnt/C/users/..."
+            base_bind_path = re.sub('^/mnt/', '/', base_bind_path)
+        if base_bind_path[1] == ':':
+            # normal windows "c:/users/..."
+            drive = base_bind_path[0]
+            path = base_bind_path[3:]
+        elif base_bind_path[0] == '/' and base_bind_path[2] == '/':
+            # gitbash "/c/users/..."
+            drive = base_bind_path[1]
+            path = base_bind_path.substring[3:]
+        else:
+            raise ValueError('Unknown path format'
+                             f'{base_bind_path[10:]}...')
+
+        # Docker Toolbox (seems like Docker for Windows can support this too)
+        bind_paths.append(f'/{drive.lower()}/{path}')
+        # Docker for Windows
+        bind_paths.append(f'{drive.lower()}:/{path}')
+        # other options just in case
+        bind_paths.append(f'/{drive.upper()}/{path}')
+        bind_paths.append(f'/mnt/{drive.lower()}/{path}')
+        bind_paths.append(f'/mnt/{drive.upper()}/{path}')
+        bind_paths.append(f'{drive.upper()}:/{path}')
+
+        for bind_path in bind_paths:
+            if self.try_bind_path(bind_path):
+                return bind_path
+
+        raise ValueError('Unable to find good bind path format')
+
+    def __init__(self, options):
+        if options.get('dockerizePip', False) == 'non-linux':
+            self._dockerizePip = sys.platform != 'linux'
+
+        if options.get('dockerImage') and options.get('dockerFile'):
+            raise ValueError('You can provide a dockerImage or a dockerFile'
+                             ' option, not both')
+
+        if not options.get('runtime'):
+            raise ValueError('runtime is required when using docker')
+
+        self._runtime = options.get('runtime')
+
+        defaultImage = f'lambci/lambda:build-{self._runtime}'
+        self._image = options.get('dockerImage') or defaultImage
+
+        self._dockerFile = options.get('dockerFile', None)
+
+    @property
+    def image(self):
+        return self._image
+
+    @property
+    def dockerFile(self):
+        return None or self._dockerFile
+
+    @property
+    def dockerizePip(self):
+        return self._dockerizePip
+
+    def build_image(self):
+        image_name = 'stacker-custom'
+        options = ['build', '-f', self.dockerFile, '-t', image_name]
+        run_command(['docker'] + options)
+        self._image = image_name
 
 
 @contextlib.contextmanager

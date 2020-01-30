@@ -24,6 +24,9 @@ from stacker.util import (
     get_config_directory,
     ensure_s3_bucket,
     tempdir,
+    run_command,
+    Docker,
+    merge_commands
 )
 
 
@@ -306,42 +309,63 @@ def _upload_prebuilt_zip(s3_conn, bucket, prefix, name, options, path,
                             version, payload_acl)
 
 
-def run_command(cmd_list, cwd, stdout=sys.stdout):
-    try:
-        subprocess.check_call(cmd_list, cwd=cwd, stdout=stdout)
-    except OSError as e:
-        if e.errno == errno.ENONET:
-            logger.error('%s is not installed!', cmd_list[0])
-        raise e
+def _generate_requirements_file(root, path):
+    logger.info('Creating requirements.txt from Pipfile')
+    with open(os.path.join(path, 'requirements.txt'), 'w') \
+            as requirements:
+        run_command([
+            'pipenv',
+            'lock',
+            '--requirements',
+            '--keep-outdated'
+        ], cwd=root, stdout=requirements)
+    return os.path.join(path, 'requirements.txt')
 
 
-def _zip_package(lock_file, root, includes, excludes, follow_symlinks):
+def _zip_package(lock_file, root, includes, excludes, follow_symlinks,
+                 options):
     with tempdir() as tmpdir:
+        if lock_file == 'Pipfile.lock':
+            _generate_requirements_file(root, tmpdir)
         files = list(_find_files(root, includes, excludes, follow_symlinks))
         for fname in files:
             copyfile(os.path.join(root, fname),
                      os.path.join(tmpdir, fname))
 
-        if lock_file == 'Pipfile.lock':
-            logger.info('Creating requirements.txt from Pipfile')
-            with open(os.path.join(tmpdir, 'requirements.txt'), 'w') \
-                    as requirements:
-                run_command([
-                    'pipenv',
-                    'lock',
-                    '--requirements',
-                    '--keep-outdated'
-                ], cwd=root, stdout=requirements)
+        pipcmd = ['python', '-m', 'pip', 'install']
+        dockercmd = []
 
-        logger.info('Restoring modules from %s' % requirements.name)
-        run_command([
-            'pip',
-            'install',
-            '-r',
-            requirements.name,
-            '-t',
-            tmpdir
-        ], cwd=tmpdir)
+        docker = Docker.parse_options(options)
+        if docker:
+            pipcmd.extend(['-t', '/var/task', '-r',
+                           '/var/task/requirements.txt'])
+
+            if docker.dockerFile:
+                docker.build_image()
+
+            dockerdir = tmpdir
+            if sys.platform.lower() == 'win32':
+                dockerdir = dockerdir.replace('\\', '/')
+
+            bind_path = docker.get_bind_path(dockerdir)
+            dockercmd.extend(['docker', 'run', '--rm', '-v',
+                              f'{bind_path}:/var/task'])
+
+            if sys.platform.lower() == 'linux':
+                pipcmd.extend(['chown', '-R', f'{os.getpid()}:{os.getpgrp()}',
+                               '/var/task'])
+            else:
+                dockercmd.extend(['-u', docker.get_uid(bind_path)])
+
+            dockercmd.extend([docker.image])
+        else:
+            pipcmd.extend(['-t', tmpdir, '-r',
+                           os.path.join(tmpdir, 'requirements.txt')])
+        if dockercmd:
+            dockercmd.extend(merge_commands([pipcmd]))
+            run_command(dockercmd, cwd=tmpdir)
+        else:
+            run_command(pipcmd, cwd=tmpdir)
 
         files = list(_find_files(tmpdir, '**', [], False))
         contents, content_hash = _zip_files(files, tmpdir)
@@ -369,7 +393,8 @@ def _build_and_upload_zip(s3_conn, bucket, prefix, name, options, path,
                                                  path,
                                                  includes,
                                                  excludes,
-                                                 follow_symlinks)
+                                                 follow_symlinks,
+                                                 options)
     else:
         zip_contents, zip_version = _zip_from_file_patterns(
             path, includes, excludes, follow_symlinks)
